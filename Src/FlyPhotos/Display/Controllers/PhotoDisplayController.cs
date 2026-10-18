@@ -270,7 +270,6 @@ internal partial class PhotoDisplayController
 
             var showDimension = AppConfig.Settings.ShowImageDimensions &&
                                 _photoSessionState.CurrentDisplayLevel != DisplayLevel.PlaceHolder &&
-                                !photo.IsVector &&
                                 !photo.IsErrorScreen(_photoSessionState.CurrentDisplayLevel);
 
             if (showDimension)

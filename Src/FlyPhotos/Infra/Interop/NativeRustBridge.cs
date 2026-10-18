@@ -24,7 +24,26 @@ internal static partial class NativeRustBridge
     internal static partial nint rawler_get_embedded_preview_from_raw(string path, out int width, out int height, out int rotation, out int primaryWidth, out int primaryHeight);
 
     [LibraryImport(DllName, StringMarshalling = StringMarshalling.Utf8)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     internal static partial nint resvg_render_svg(string path, int maxDimension, out int width, out int height);
+
+    /// <summary>
+    /// Writes the SVG document size in user units. Returns 1 on success.
+    /// A DLL built before this export existed fails with <see cref="EntryPointNotFoundException"/>.
+    /// </summary>
+    [LibraryImport(DllName, StringMarshalling = StringMarshalling.Utf8)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial int resvg_svg_intrinsic_size(string path, out float width, out float height);
+
+    /// <summary>
+    /// Renders the SVG region <c>(srcX, srcY, srcW, srcH)</c> in user units into an
+    /// <paramref name="outWidth"/>×<paramref name="outHeight"/> straight RGBA buffer.
+    /// </summary>
+    [LibraryImport(DllName, StringMarshalling = StringMarshalling.Utf8)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial nint resvg_render_svg_region(
+        string path, float srcX, float srcY, float srcW, float srcH,
+        int outWidth, int outHeight, out int width, out int height);
 
     // ── Memory management ─────────────────────────────────────────────────────
 

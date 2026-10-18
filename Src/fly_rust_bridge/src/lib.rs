@@ -3,12 +3,13 @@ use rawler::decoders::{Orientation, RawDecodeParams};
 use rawler::imgop::develop::{Intermediate, RawDevelop};
 use rawler::rawsource::RawSource;
 use rayon::prelude::*;
+use resvg::{tiny_skia, usvg};
 use std::ffi::CStr;
 use std::panic::catch_unwind;
 use std::path::Path;
 use std::slice;
-use std::sync::{Arc, LazyLock};
-use resvg::{usvg, tiny_skia};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::UNIX_EPOCH;
 use usvg::fontdb;
 
 // FFI bridge to C# (via P/Invoke). All exported functions share the same memory
@@ -26,6 +27,24 @@ static FONT_DB: LazyLock<Arc<fontdb::Database>> = LazyLock::new(|| {
     db.load_system_fonts();
     Arc::new(db)
 });
+
+/// Parsed SVGs kept across zoom re-renders. One photo viewer rarely has more than a
+/// couple of SVGs warm at once; the cap just stops a long session from retaining every
+/// file it ever opened.
+const SVG_CACHE_LIMIT: usize = 4;
+/// Safety cap on one raster buffer. This is not a zoom limit: the caller renders only
+/// the visible region, which is about the size of the screen. 8192 stops a bad request
+/// from allocating a multi-gigabyte pixmap.
+const SVG_MAX_EDGE: u32 = 8192;
+
+struct CachedSvg {
+    path: String,
+    len: u64,
+    modified_ms: u128,
+    tree: Arc<usvg::Tree>,
+}
+
+static SVG_CACHE: Mutex<Vec<CachedSvg>> = Mutex::new(Vec::new());
 
 /// Borrows a C string as a &str for the duration of the calling scope.
 /// SAFETY: Caller must ensure `ptr` remains valid for 'a. Lifetime is unconstrained
@@ -291,13 +310,45 @@ pub extern "C" fn free_formats_buffer(ptr: *mut *mut c_char, size: c_int) {
     }
 }
 
+/// Writes the SVG's intrinsic size in user units (the viewBox / width / height resvg
+/// resolves, not a raster). Returns 1 on success and 0 on failure.
+///
+/// This is the document size ImageGlass v10 reads from the picture cull rect: 100% zoom
+/// is one SVG unit per screen pixel, and any larger zoom re-renders instead of stretching
+/// a bitmap.
+#[unsafe(no_mangle)]
+pub extern "C" fn resvg_svg_intrinsic_size(
+    path_ptr: *const c_char,
+    width: *mut f32,
+    height: *mut f32,
+) -> c_int {
+    let result = catch_unwind(|| {
+        let path = ptr_to_str(path_ptr)?;
+        let tree = load_svg_tree(path)?;
+        let w = tree.size().width();
+        let h = tree.size().height();
+        if !(w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0) {
+            return None;
+        }
+        unsafe {
+            if !width.is_null() {
+                *width = w;
+            }
+            if !height.is_null() {
+                *height = h;
+            }
+        }
+        Some(1)
+    });
+    result.ok().flatten().unwrap_or(0)
+}
+
 /// Renders an SVG file into a heap-allocated straight RGBA8 buffer, scaled so
 /// that the longer axis equals `max_dimension` (aspect ratio is preserved).
 /// Caller receives the final pixel dimensions via `width`/`height` out-params.
 ///
-/// tiny_skia produces premultiplied RGBA internally; this function unpremultiplies
-/// before returning so the output format is consistent with the rawler functions
-/// and matches DirectXPixelFormat.R8G8B8A8UIntNormalized on the C# side.
+/// Used for thumbnails and the first backdrop. Zoom does not go through this entry
+/// point — see [`resvg_render_svg_region`].
 ///
 /// Returns null on any failure (bad path, parse error, zero dimensions, panic).
 /// On success, caller MUST free the buffer with `free_rust_buffer(ptr, width*height*4)`.
@@ -309,79 +360,168 @@ pub extern "C" fn resvg_render_svg(
     height: *mut c_int,
 ) -> *mut u8 {
     let result = catch_unwind(|| {
-        let process = || -> Option<*mut u8> {
-            // 1. Decode the path — reuses the same helper as the rawler functions.
-            let path = ptr_to_str(path_ptr)?;
+        if max_dimension <= 0 {
+            return None;
+        }
+        let path = ptr_to_str(path_ptr)?;
+        let tree = load_svg_tree(path)?;
+        let svg_width = tree.size().width();
+        let svg_height = tree.size().height();
+        if !(svg_width > 0.0 && svg_height > 0.0) {
+            return None;
+        }
 
-            let svg_data = std::fs::read(path).ok()?;
-
-            // 2. Configure usvg with the global font database (initialised once on
-            //    first call via LazyLock — avoids a multi-hundred-ms hit per render).
-            let mut options = usvg::Options::default();
-            options.fontdb = FONT_DB.clone();
-            options.font_family = "Arial".to_string();
-
-            // 3. Parse the SVG into a usvg::Tree.
-            let tree = usvg::Tree::from_data(&svg_data, &options).ok()?;
-
-            let svg_width = tree.size().width();
-            let svg_height = tree.size().height();
-
-            // 4. Aspect-ratio-preserving scale: fit the longer axis to max_dimension.
-            let (w, h) = if svg_width >= svg_height {
-                (max_dimension as f32, max_dimension as f32 * (svg_height / svg_width))
-            } else {
-                (max_dimension as f32 * (svg_width / svg_height), max_dimension as f32)
-            };
-
-            let (rw, rh) = (w.round() as u32, h.round() as u32);
-
-            // Guard: a zero-area pixmap would produce an empty but non-null buffer
-            // that the caller cannot usefully free via free_rust_buffer(ptr, 0).
-            if rw == 0 || rh == 0 {
-                return None;
-            }
-
-            // 5. Allocate the pixel buffer.
-            let mut pixmap = tiny_skia::Pixmap::new(rw, rh)?;
-
-            // 6. Render. resvg::render fills pixmap in-place with premultiplied RGBA.
-            resvg::render(
-                &tree,
-                tiny_skia::Transform::from_scale(
-                    rw as f32 / svg_width,
-                    rh as f32 / svg_height,
-                ),
-                &mut pixmap.as_mut(),
-            );
-
-            // 7. Unpremultiply alpha in parallel (premultiplied → straight RGBA).
-            //    Pixels with a == 0 (fully transparent) or a == 255 (fully opaque)
-            //    need no correction and are left unchanged.
-            let mut pixels = pixmap.take();
-            pixels.par_chunks_exact_mut(4).for_each(|chunk| {
-                let a = chunk[3];
-                if a > 0 && a < 255 {
-                    let a_f = a as f32 / 255.0;
-                    chunk[0] = (chunk[0] as f32 / a_f).min(255.0) as u8;
-                    chunk[1] = (chunk[1] as f32 / a_f).min(255.0) as u8;
-                    chunk[2] = (chunk[2] as f32 / a_f).min(255.0) as u8;
-                }
-            });
-
-            // 8. Write out-params through safe_write_int to guard against null pointers.
-            unsafe {
-                safe_write_int(width, rw as c_int);
-                safe_write_int(height, rh as c_int);
-            }
-
-            // 9. Transfer ownership to the caller using the same Box<[u8]> contract
-            //    as every other function in this file so free_rust_buffer works correctly.
-            Some(Box::into_raw(pixels.into_boxed_slice()) as *mut u8)
+        // Fit the longer axis to max_dimension, preserving aspect ratio.
+        let (w, h) = if svg_width >= svg_height {
+            (max_dimension as f32, max_dimension as f32 * (svg_height / svg_width))
+        } else {
+            (max_dimension as f32 * (svg_width / svg_height), max_dimension as f32)
         };
-
-        process().unwrap_or(std::ptr::null_mut())
+        let (rw, rh) = (w.round() as u32, h.round() as u32);
+        let pixels = render_svg_region(&tree, 0.0, 0.0, svg_width, svg_height, rw, rh)?;
+        unsafe {
+            safe_write_int(width, rw as c_int);
+            safe_write_int(height, rh as c_int);
+        }
+        Some(Box::into_raw(pixels.into_boxed_slice()) as *mut u8)
     });
+    result.ok().flatten().unwrap_or(std::ptr::null_mut())
+}
 
-    result.unwrap_or(std::ptr::null_mut())
+/// Renders the SVG region `[src_x, src_y, src_w, src_h]` (user units) into an
+/// `out_width`×`out_height` straight RGBA8 buffer.
+///
+/// This is how zoom stays sharp without a WebView: the view asks for the visible
+/// slice at the current scale, so a 1-unit stroke stays one device pixel wide per
+/// unit of zoom no matter how far the user goes. There is no document-size cap.
+///
+/// `out_width` and `out_height` must be in `1..=8192`. Returns null on failure.
+/// On success, caller MUST free the buffer with `free_rust_buffer(ptr, width*height*4)`.
+#[unsafe(no_mangle)]
+pub extern "C" fn resvg_render_svg_region(
+    path_ptr: *const c_char,
+    src_x: f32,
+    src_y: f32,
+    src_w: f32,
+    src_h: f32,
+    out_width: c_int,
+    out_height: c_int,
+    width: *mut c_int,
+    height: *mut c_int,
+) -> *mut u8 {
+    let result = catch_unwind(|| {
+        if out_width <= 0 || out_height <= 0 {
+            return None;
+        }
+        let path = ptr_to_str(path_ptr)?;
+        let tree = load_svg_tree(path)?;
+        let pixels = render_svg_region(
+            &tree,
+            src_x,
+            src_y,
+            src_w,
+            src_h,
+            out_width as u32,
+            out_height as u32,
+        )?;
+        unsafe {
+            safe_write_int(width, out_width);
+            safe_write_int(height, out_height);
+        }
+        Some(Box::into_raw(pixels.into_boxed_slice()) as *mut u8)
+    });
+    result.ok().flatten().unwrap_or(std::ptr::null_mut())
+}
+
+/// Parses `path`, reusing a small cache so a zoom gesture does not re-read the file
+/// and rebuild the font-resolved tree on every frame.
+fn load_svg_tree(path: &str) -> Option<Arc<usvg::Tree>> {
+    let meta = std::fs::metadata(path).ok()?;
+    let len = meta.len();
+    let modified_ms = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+
+    let mut cache = SVG_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(hit) = cache
+        .iter()
+        .find(|e| e.path == path && e.len == len && e.modified_ms == modified_ms)
+    {
+        return Some(hit.tree.clone());
+    }
+
+    let svg_data = std::fs::read(path).ok()?;
+    let mut options = usvg::Options::default();
+    options.fontdb = FONT_DB.clone();
+    options.font_family = "Arial".to_string();
+    let tree = Arc::new(usvg::Tree::from_data(&svg_data, &options).ok()?);
+
+    cache.retain(|e| e.path != path);
+    if cache.len() >= SVG_CACHE_LIMIT {
+        cache.remove(0);
+    }
+    cache.push(CachedSvg {
+        path: path.to_string(),
+        len,
+        modified_ms,
+        tree: tree.clone(),
+    });
+    Some(tree)
+}
+
+/// Rasterises one axis-aligned region of `tree`.
+///
+/// Pixel `(0, 0)` of the output is SVG point `(src_x, src_y)`. The scale is
+/// `out_w / src_w` by `out_h / src_h`, so the caller chooses the zoom by choosing
+/// how many pixels a user-unit span occupies.
+fn render_svg_region(
+    tree: &usvg::Tree,
+    src_x: f32,
+    src_y: f32,
+    src_w: f32,
+    src_h: f32,
+    out_w: u32,
+    out_h: u32,
+) -> Option<Vec<u8>> {
+    if !(src_x.is_finite() && src_y.is_finite() && src_w.is_finite() && src_h.is_finite()) {
+        return None;
+    }
+    if src_w <= 0.0 || src_h <= 0.0 || out_w == 0 || out_h == 0 {
+        return None;
+    }
+    if out_w > SVG_MAX_EDGE || out_h > SVG_MAX_EDGE {
+        return None;
+    }
+    // Reject a size that cannot be described as a byte length. The edge cap already
+    // keeps this tiny; the check is the overflow guard for the allocation.
+    let _bytes = (out_w as usize).checked_mul(out_h as usize)?.checked_mul(4)?;
+
+    let mut pixmap = tiny_skia::Pixmap::new(out_w, out_h)?;
+    // Translate the region origin to 0, then scale user units onto the pixmap.
+    // pre_translate applies the translation before the scale.
+    let transform = tiny_skia::Transform::from_scale(out_w as f32 / src_w, out_h as f32 / src_h)
+        .pre_translate(-src_x, -src_y);
+    resvg::render(tree, transform, &mut pixmap.as_mut());
+
+    let mut pixels = pixmap.take();
+    unpremultiply_straight(&mut pixels);
+    Some(pixels)
+}
+
+/// tiny_skia writes premultiplied RGBA. FlyPhotos' Win2D bitmaps are straight
+/// `R8G8B8A8UIntNormalized`, so convert in place. Fully transparent and fully
+/// opaque pixels need no correction.
+fn unpremultiply_straight(pixels: &mut [u8]) {
+    pixels.par_chunks_exact_mut(4).for_each(|chunk| {
+        let a = chunk[3];
+        if a > 0 && a < 255 {
+            let a_f = a as f32 / 255.0;
+            chunk[0] = (chunk[0] as f32 / a_f).min(255.0) as u8;
+            chunk[1] = (chunk[1] as f32 / a_f).min(255.0) as u8;
+            chunk[2] = (chunk[2] as f32 / a_f).min(255.0) as u8;
+        }
+    });
 }

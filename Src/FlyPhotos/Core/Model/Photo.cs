@@ -124,8 +124,15 @@ internal partial class Photo : IDisposable
     /// so it can go straight to the tiled reader and skip the normal decoders, which would fail. Known when an
     /// earlier load found it oversized, or when the preview metadata gives the full size.
     /// </summary>
-    private bool IsKnownOversized(int maxSize) => _probedOversized ||
-        Preview?.Metadata is { FullWidth: > 0, FullHeight: > 0 } m && (m.FullWidth > maxSize || m.FullHeight > maxSize);
+    private bool IsKnownOversized(int maxSize)
+    {
+        // SVG metadata is the document's user units, not a pixel buffer. A wide viewBox
+        // must stay on the vector decoder instead of the tiled bitmap path.
+        if (IsVector) return false;
+        return _probedOversized ||
+            Preview?.Metadata is { FullWidth: > 0, FullHeight: > 0 } m &&
+            (m.FullWidth > maxSize || m.FullHeight > maxSize);
+    }
 
     public async Task LoadPreview(ICanvasResourceCreatorWithDpi device)
     {
@@ -153,6 +160,10 @@ internal partial class Photo : IDisposable
     {
         if (Hq is TiledHqDisplayItem tiled)
             return (tiled.Pyramid.FullWidth, tiled.Pyramid.FullHeight);
+        // The backdrop bitmap is a screen-sized raster. The document size is the SVG's own
+        // user units, which is what fit and 100% zoom are measured against.
+        if (Hq is VectorHqDisplayItem vector)
+            return (vector.SvgWidth, vector.SvgHeight);
         if (Hq?.Bitmap != null)
         {
             return (Hq.Bitmap.SizeInPixels.Width, Hq.Bitmap.SizeInPixels.Height);
