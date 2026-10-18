@@ -52,6 +52,21 @@ internal sealed partial class TiledHqDisplayItem(CanvasBitmap overview, Origin o
     public TilePyramid Pyramid { get; } = pyramid;
 }
 
+/// <summary>
+/// An SVG kept as vectors. <see cref="DisplayItem.Bitmap"/> is a low-resolution backdrop of the
+/// whole document; the canvas re-renders the visible region from <see cref="Path"/> at the
+/// current zoom, so there is no fixed pixel cap.
+/// <see cref="SvgWidth"/> and <see cref="SvgHeight"/> are the SVG's own user units (100% zoom).
+/// </summary>
+internal sealed partial class VectorHqDisplayItem(
+    CanvasBitmap bitmap, Origin origin, string path, double svgWidth, double svgHeight)
+    : HqDisplayItem(bitmap, origin, 0)
+{
+    public string Path { get; } = path;
+    public double SvgWidth { get; } = svgWidth;
+    public double SvgHeight { get; } = svgHeight;
+}
+
 internal sealed partial class MultiPageHqDisplayItem(CanvasBitmap firstFrame, Origin origin, byte[] fileAsByteArray,
     int[] pageOrder) : HqDisplayItem(firstFrame, origin, 0)
 {
